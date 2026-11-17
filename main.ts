@@ -9,7 +9,9 @@
 // that: it waits for the price to fall at least 2.75 standard deviations below its
 // 300-bar (5-hour) mean, then sells when it has recovered to 1.5 deviations above that
 // mean, or cuts the position 2% below its entry if the dip keeps falling instead. On the
-// dev window that is two round trips for +$16.00 net, max drawdown 0.72%.
+// dev window that is two round trips for +$16.00 net, max drawdown 0.72%. A tiered
+// fallback relaxes the entry if the bot has still never traded late in the window,
+// so a trend-only window still yields at least one trade.
 //
 // Determinism: the bot keeps the closes it has seen and recomputes the mean and the
 // population standard deviation over the last 300 of them on every bar, in float64. It
@@ -31,11 +33,19 @@ const Z_OUT = 1.5;
 const STOP_LOSS = 0.02;
 /** No new entries in the last 90 bars: a late entry has no time to recover its costs. */
 const NO_ENTRY_AFTER = TOTAL_BARS - 90;
-/** The fallback: if the bot has still never held a position by this bar, it buys a
- *  milder dip, so the entry still makes at least one trade on a window where the deep
- *  dip never comes (a flat window fails the guardrails with zero trades). */
-const FALLBACK_BAR = 1200;
-const FALLBACK_Z = 1.0;
+/** The fallback tiers: if the bot has still never held a position, the dip it waits
+ *  for gets milder as the window runs out, so the entry still makes at least one trade
+ *  on a window where the deep dip never comes (a flat window fails the guardrails
+ *  with zero trades, which ranks below every entry that made one). The last tier buys
+ *  at the market: on a strong uptrend the price never dips at all, and buying the
+ *  trend for the final two hours beats sitting out entirely. The stop-loss still
+ *  applies to a fallback buy. None of these tiers fires on the dev window, where the
+ *  first deep dip comes at bar 371. */
+const FALLBACKS = [
+  { bar: 720, z: 2.0 },
+  { bar: 1200, z: 1.0 },
+  { bar: 1300, z: Infinity },
+];
 /** The fill must land within 2% of the close the order was decided on; a 1-minute move
  *  is normally a few hundredths of a percent, so this only refuses a genuine gap. */
 const MAX_SLIPPAGE_BPS = 200;
@@ -94,9 +104,13 @@ await runBars({
     }
 
     if (batch.seq >= NO_ENTRY_AFTER) return [];
-    const deepDip = z <= -Z_IN;
-    const fallback = !everHeld && batch.seq >= FALLBACK_BAR && z <= -FALLBACK_Z;
-    if (!deepDip && !fallback) return [];
+    let threshold = Z_IN;
+    if (!everHeld) {
+      for (const tier of FALLBACKS) {
+        if (batch.seq >= tier.bar) threshold = tier.z;
+      }
+    }
+    if (z > -threshold) return [];
     let notional = state.cash;
     const room = state.weightRoom(SYMBOL);
     if (room < notional) notional = room;
