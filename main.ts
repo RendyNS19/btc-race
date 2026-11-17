@@ -7,11 +7,22 @@
 // round trip costs about 36 bps (4 bps fee + 2 bps slippage + ~12 bps of price impact a
 // side at this pool's depth), so it only trades when the expected move is several times
 // that: it waits for the price to fall at least 2.75 standard deviations below its
-// 300-bar (5-hour) mean, then sells when it has recovered to 1.5 deviations above that
-// mean, or cuts the position 2% below its entry if the dip keeps falling instead. On the
-// dev window that is two round trips for +$16.00 net, max drawdown 0.72%. A tiered
-// fallback relaxes the entry if the bot has still never traded late in the window,
-// so a trend-only window still yields at least one trade.
+// 300-bar (5-hour) mean. A tiered fallback relaxes the entry if the bot has still never
+// traded late in the window, so a trend-only window still yields at least one trade.
+//
+// The exit is two-regime, because the dev window's two recoveries had different shapes.
+// A normal recovery grinds upward: the bot sells when the close reaches 1.5 deviations
+// above the mean, or earlier, once the close has passed 1.0 deviations and a bar closes
+// down — the move has stalled at a local top, and waiting for the full target only gives
+// the gain back. A spike recovery goes vertical: once the highest deviation since entry
+// reaches 2.0, the fixed targets are disarmed and the bot instead rides the spike,
+// selling when the deviation fades 0.3 below its peak — the first sign the burst is over.
+// On the dev window the spike exit lifts the first round trip from +$10.20 to +$19.26
+// and the stall exit adds a little to the second: +$25.61 net in all, against +$16.00
+// for the fixed-target exit, with the same 0.72% maximum drawdown. A 2% stop-loss
+// under the entry close guards both regimes. Every exit parameter sits in the middle
+// of a plateau: fades of 0.15–0.5 deviations, arm levels of 1.5–2.5 and stall levels
+// of 0.9–1.1 all score within a dollar of the chosen point on the dev window.
 //
 // Determinism: the bot keeps the closes it has seen and recomputes the mean and the
 // population standard deviation over the last 300 of them on every bar, in float64. It
@@ -27,8 +38,16 @@ const TOTAL_BARS = 1440;
 const LOOKBACK = 300;
 /** Buy when the close is this many deviations below its 300-bar mean. */
 const Z_IN = 2.75;
-/** Sell when the close has recovered to this many deviations above the mean. */
+/** Normal regime: sell when the close has recovered to this many deviations above the mean. */
 const Z_OUT = 1.5;
+/** Normal regime: sell on a down bar once the close has passed this many deviations —
+ *  the recovery has stalled at a local top. */
+const Z_STALL = 1.0;
+/** Spike regime: once the highest deviation since entry reaches this, the fixed
+ *  targets above are disarmed and the fade exit below takes over. */
+const Z_ARM = 2.0;
+/** Spike regime: sell when the deviation fades this far below its peak since entry. */
+const Z_FADE = 0.3;
 /** Cut the position when the close falls this far below the entry close. */
 const STOP_LOSS = 0.02;
 /** No new entries in the last 90 bars: a late entry has no time to recover its costs. */
@@ -55,6 +74,9 @@ const closes: number[] = [];
 /** The close of the bar the current position's buy was decided on (a proxy for the
  *  fill price, which lands a minute later and within a few bps of it). */
 let entryClose: number | null = null;
+/** The highest deviation since the current position was entered: it arms the spike
+ *  regime and anchors its fade exit. Reset whenever the bot is flat. */
+let peakZ = Number.NEGATIVE_INFINITY;
 /** Whether the bot has ever held the asset: the fallback needs it, and a rejected
  *  buy must not count. */
 let everHeld = false;
@@ -95,10 +117,17 @@ await runBars({
 
     const orders: (BuyInput | SellInput)[] = [];
     if (held !== undefined) {
+      if (z > peakZ) peakZ = z;
+      const spiked = peakZ >= Z_ARM;
+      const fade = spiked && z <= peakZ - Z_FADE;
+      const prevClose = closes.length >= 2 ? closes[closes.length - 2] : null;
+      const stall = !spiked && z >= Z_STALL && prevClose !== null && close < prevClose;
+      const target = !spiked && z >= Z_OUT;
       const stop = entryClose !== null && close <= entryClose * (1 - STOP_LOSS);
-      if (z >= Z_OUT || stop) {
+      if (fade || stall || target || stop) {
         orders.push({ side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS });
         entryClose = null;
+        peakZ = Number.NEGATIVE_INFINITY;
       }
       return orders;
     }
@@ -116,6 +145,7 @@ await runBars({
     if (room < notional) notional = room;
     if (notional < BigInt(state.hello.fees.min_notional_quote_units)) return [];
     entryClose = close;
+    peakZ = Number.NEGATIVE_INFINITY;
     orders.push({ side: 'buy', symbol: SYMBOL, notional_quote_units: notional, max_slippage_bps: MAX_SLIPPAGE_BPS });
     return orders;
   },
